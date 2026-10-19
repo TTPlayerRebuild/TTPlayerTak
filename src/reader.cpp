@@ -1,3 +1,4 @@
+#include "ttpcomm/audio_format_probe_impl.h"
 #include "io.h"
 #include <cmath>
 #include <atomic>
@@ -12,7 +13,7 @@ extern "C" {
 namespace ttp::tak {
 namespace {
 struct Tag { std::string key; std::wstring value; };
-class AudioReader final : public Reader, public Metadata {
+class AudioReader final : public Reader, public Metadata, public ttp::format::InfoSupport {
     LONG refs_{1}; Input input_; ComPtr<Metadata> host_tags_;
     AVFormatContext *container_{}; AVIOContext *io_{};
     AVCodecContext *decoder_{}; AVPacket *packet_{av_packet_alloc()}; AVFrame *frame_{av_frame_alloc()};
@@ -138,6 +139,9 @@ class AudioReader final : public Reader, public Metadata {
     ~AudioReader(){close_container();input_.extended.reset();input_.stream.reset();host_tags_.reset();av_packet_free(&packet_);av_frame_free(&frame_);}
 public:
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id,void **out) override{
+        if (!out) return E_POINTER;
+        if (IsEqualIID(id, ttp::format::iid_info)) { *out=static_cast<ttp::format::SourceInfo*>(this); AddRef(); return S_OK; }
+
         if(!out)return E_POINTER;*out=nullptr;
         if(same(id,IID_IUnknown)||same(id,iid_reader))*out=static_cast<Reader*>(this);
         else if(same(id,iid_metadata))*out=static_cast<Metadata*>(this);
@@ -147,7 +151,12 @@ public:
     }
     ULONG STDMETHODCALLTYPE AddRef() override{return InterlockedIncrement(&refs_);}
     ULONG STDMETHODCALLTYPE Release() override{auto n=InterlockedDecrement(&refs_);if(!n)delete this;return n;}
-    HRESULT STDMETHODCALLTYPE Open(IStream *stream,DWORD flags) override{
+    HRESULT STDMETHODCALLTYPE Open(IStream* probe_stream, DWORD probe_flags) override {
+        const auto probed = PrepareFormatInfo(probe_stream, ttp::format::Tak);
+        if (FAILED(probed)) return probed;
+        return CompleteFormatInfo(OpenImpl(probe_stream, probe_flags));
+    }
+    HRESULT OpenImpl(IStream *stream,DWORD flags){
         if(!stream)return E_POINTER;if(input_.stream)return E_UNEXPECTED;
         return protect([&]()->HRESULT{
             require(packet_&&frame_,E_OUTOFMEMORY);input_.open(stream);

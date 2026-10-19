@@ -29,3 +29,7 @@ GNU make 源码及构建规则。Action 发布自动携带此附件；运行 ZIP
 具体构建版本、固定 URL/hash 和配置在 `cmake/build_ffmpeg.py`，不嵌入许可证资源。
 
 详见 [验证与剩余差异](docs/VALIDATION_20261019.md)。
+
+## 可选格式识别接口
+
+2026-10-20：Reader 工厂增加 Probe，Reader 增加 SourceInfo；旧导出和接口槽位保持不变。声明与辅助实现位于 `include/ttpcomm/audio_format_probe.h` 和 `audio_format_probe_impl.h`，不增加运行时 DLL 依赖。协议原件在相邻 `ttpcomm/sdk/AUDIO_FORMAT_PROBE.md`；新建插件指南在相邻 `rebuild/docs/AUDIO_PLUGIN_DEVELOPMENT_GUIDE.md`。原版播放器继续使用旧接口；错误后缀候选选择和更名提示由支持新协议的重建播放器执行。
