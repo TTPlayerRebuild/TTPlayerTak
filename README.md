@@ -1,5 +1,7 @@
 # ttp_tak
 
+最新补全与验收：[2026-10-24](docs/COMPLETION_20261024.md)。
+
 原版 TTPlayer TAK Reader ABI 的独立源码实现。解码采用固定 FFmpeg 9.0.2 最小
 TAK demuxer/parser/decoder，不加载旧 `tak_deco_lib.dll`。
 

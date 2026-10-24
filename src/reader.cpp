@@ -1,4 +1,5 @@
 #include "ttpcomm/audio_format_probe_impl.h"
+#include "ttpcomm/pcm_format.h"
 #include "io.h"
 #include <cmath>
 #include <atomic>
@@ -13,15 +14,44 @@ extern "C" {
 namespace ttp::tak {
 namespace {
 struct Tag { std::string key; std::wstring value; };
-class AudioReader final : public Reader, public Metadata, public ttp::format::InfoSupport {
+class AudioReader final : public Reader, public Metadata, public MetadataCommit, public ttp::format::InfoSupport {
     LONG refs_{1}; Input input_; ComPtr<Metadata> host_tags_;
+    ComPtr<MetadataCommit> host_commit_;bool committed_{};HRESULT commit_result_{S_OK};
     AVFormatContext *container_{}; AVIOContext *io_{};
     AVCodecContext *decoder_{}; AVPacket *packet_{av_packet_alloc()}; AVFrame *frame_{av_frame_alloc()};
-    int stream_index_{-1}; WAVEFORMATEX format_{};
+    int stream_index_{-1}; WAVEFORMATEX format_{}; DWORD channel_mask_{};
     std::vector<Tag> tags_; Bytes pcm_; size_t consumed_{};
     uint64_t position_{},total_samples_{}; DWORD duration_{},bitrate_{};
     struct SeekPoint {uint64_t sample;int64_t offset;};std::vector<SeekPoint> index_;
+    uint64_t index_spacing_{1};
+    void remember(uint64_t sample,int64_t offset){
+        if(offset<0 || (!index_.empty() && (sample<=index_.back().sample || sample-index_.back().sample<index_spacing_)))return;
+        if(index_.size()>=4096){size_t to=1;for(size_t from=2;from<index_.size();from+=2)index_[to++]=index_[from];index_.resize(to);index_spacing_=std::min<uint64_t>(index_spacing_*2,UINT32_MAX);}
+        index_.push_back({sample,offset});
+    }
     HRESULT io_error_{S_OK}; bool opened_{},draining_{},eof_{};std::atomic_bool stopped_{};
+    bool resume_pending_{}; uint64_t resume_position_{};
+    void io_failure(HRESULT hr) {
+        io_error_=hr;
+        if(hr==E_ABORT || hr==HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
+            if(input_.seekable) {
+                if(!resume_pending_) resume_position_=position_;
+                resume_pending_=true;
+            } else io_error_=STG_E_READFAULT;
+        }
+    }
+    void replay_to(uint64_t target) {
+        // A failed IStream read may have consumed input. Rebuild from a known
+        // position instead of clearing AVIO's error and skipping those bytes.
+        resume_pending_=true; resume_position_=target;
+        close_container(); input_.at(input_.base); position_=0; open_container();
+        while(position_<target) {
+            require(consumed_!=pcm_.size() || next(),STG_E_READFAULT);
+            auto n=std::min<uint64_t>(target-position_,(pcm_.size()-consumed_)/format_.nBlockAlign);
+            consumed_+=size_t(n)*format_.nBlockAlign;position_+=n;
+        }
+        resume_pending_=false;
+    }
     std::wstring codec_name_;
     static int read_callback(void *opaque,uint8_t *data,int bytes) noexcept {
         auto &s=*static_cast<AudioReader*>(opaque);ULONG got{};
@@ -29,7 +59,7 @@ class AudioReader final : public Reader, public Metadata, public ttp::format::In
             require(bytes>0,E_INVALIDARG);require(!s.stopped_,HRESULT_FROM_WIN32(ERROR_CANCELLED));
             got=s.input_.read(data,DWORD(bytes));return S_OK;
         });
-        if(FAILED(hr)){s.io_error_=hr;return AVERROR(EIO);}return got?int(got):AVERROR_EOF;
+        if(FAILED(hr)){s.io_failure(hr);return AVERROR(EIO);}return got?int(got):AVERROR_EOF;
     }
     static int64_t seek_callback(void *opaque,int64_t offset,int whence) noexcept {
         auto &s=*static_cast<AudioReader*>(opaque);int64_t result=-1;
@@ -74,6 +104,9 @@ class AudioReader final : public Reader, public Metadata, public ttp::format::In
         require(format_.wBitsPerSample==8||format_.wBitsPerSample==16||format_.wBitsPerSample==24||format_.wBitsPerSample==32,E_NOTIMPL);
         format_.nBlockAlign=WORD(format_.nChannels*(format_.wBitsPerSample/8));
         format_.nAvgBytesPerSec=format_.nSamplesPerSec*format_.nBlockAlign;
+        require(p->ch_layout.order==AV_CHANNEL_ORDER_NATIVE || p->ch_layout.order==AV_CHANNEL_ORDER_UNSPEC,E_NOTIMPL);
+        require(p->ch_layout.order!=AV_CHANNEL_ORDER_NATIVE || p->ch_layout.u.mask<=0x3ffff,E_NOTIMPL);
+        channel_mask_=p->ch_layout.order==AV_CHANNEL_ORDER_NATIVE?DWORD(p->ch_layout.u.mask):0;
         bitrate_=dword(std::max<int64_t>(p->bit_rate,0));
         const auto *st=container_->streams[stream_index_];
         if(st->duration!=AV_NOPTS_VALUE&&st->duration>0){
@@ -131,7 +164,7 @@ class AudioReader final : public Reader, public Metadata, public ttp::format::In
             while(result>=0&&packet_->stream_index!=stream_index_);
             if(result==AVERROR_EOF){draining_=true;check_av(avcodec_send_packet(decoder_,nullptr));}
             else{check_av(result);
-                if(packet_->pos>=0&&(index_.empty()||position_>index_.back().sample))index_.push_back({position_,packet_->pos});
+                remember(position_,packet_->pos);
                 check_av(avcodec_send_packet(decoder_,packet_));}
         }
         throw Failure{HRESULT_FROM_WIN32(ERROR_INVALID_DATA)};
@@ -145,11 +178,17 @@ public:
         if(!out)return E_POINTER;*out=nullptr;
         if(same(id,IID_IUnknown)||same(id,iid_reader))*out=static_cast<Reader*>(this);
         else if(same(id,iid_metadata))*out=static_cast<Metadata*>(this);
+        else if(same(id,iid_metadata_commit)&&host_commit_)*out=static_cast<MetadataCommit*>(this);
         else if(same(id,iid_thumbnail)&&host_tags_)return host_tags_->QueryInterface(id,out);
         else return E_NOINTERFACE;
         AddRef();return S_OK;
     }
     ULONG STDMETHODCALLTYPE AddRef() override{return InterlockedIncrement(&refs_);}
+    HRESULT STDMETHODCALLTYPE Commit() override{
+        if(committed_)return commit_result_;if(!opened_||!host_commit_)return E_UNEXPECTED;
+        committed_=true;close_container();input_.extended.reset();input_.stream.reset();opened_=false;
+        commit_result_=host_commit_->Commit();return commit_result_;
+    }
     ULONG STDMETHODCALLTYPE Release() override{auto n=InterlockedDecrement(&refs_);if(!n)delete this;return n;}
     HRESULT STDMETHODCALLTYPE Open(IStream* probe_stream, DWORD probe_flags) override {
         const auto probed = PrepareFormatInfo(probe_stream, ttp::format::Tak);
@@ -157,12 +196,13 @@ public:
         return CompleteFormatInfo(OpenImpl(probe_stream, probe_flags));
     }
     HRESULT OpenImpl(IStream *stream,DWORD flags){
-        if(!stream)return E_POINTER;if(input_.stream)return E_UNEXPECTED;
+        if(!stream)return E_POINTER;if(input_.stream||committed_)return E_UNEXPECTED;
         return protect([&]()->HRESULT{
             require(packet_&&frame_,E_OUTOFMEMORY);input_.open(stream);
             if(input_.seekable&&!input_.remote)if(auto host=standard_content()){
                 ULONGLONG bytes{};auto hr=host(stream,4,host_tags_.put(),&bytes);
                 if(FAILED(hr))host_tags_.reset();input_.at(input_.base);
+                if(host_tags_)host_tags_->QueryInterface(iid_metadata_commit,reinterpret_cast<void**>(host_commit_.put()));
             }
             open_container();
             AVDictionaryEntry *t=nullptr;
@@ -175,10 +215,9 @@ public:
     }
     HRESULT STDMETHODCALLTYPE Capabilities(DWORD *out) override{if(!out)return E_POINTER;*out=host_tags_?input_.capabilities(true):((input_.remote?1:0)|(input_.seekable?2:0));return S_OK;}
     HRESULT STDMETHODCALLTYPE Duration(DWORD *out) override{if(!out)return E_POINTER;*out=duration_;return opened_?S_OK:E_UNEXPECTED;}
-    HRESULT STDMETHODCALLTYPE Format(WAVEFORMATEX **out) override{
+    HRESULT STDMETHODCALLTYPE Format(WAVEFORMATEX **out) override {
         if(!out)return E_POINTER;*out=nullptr;if(!opened_)return E_UNEXPECTED;
-        auto *p=static_cast<WAVEFORMATEX*>(CoTaskMemAlloc(sizeof(format_)));if(!p)return E_OUTOFMEMORY;
-        *p=format_;*out=p;return S_OK;
+        return ttp::pcm::copy_format(format_, channel_mask_, format_.wBitsPerSample, out);
     }
     HRESULT STDMETHODCALLTYPE BufferSize(DWORD *out) override{if(!out)return E_POINTER;*out=(format_.nSamplesPerSec/4)*format_.nBlockAlign;return opened_?S_OK:E_UNEXPECTED;}
     HRESULT STDMETHODCALLTYPE CodecName(wchar_t **out) override{return text(codec_name_,out);}
@@ -193,6 +232,7 @@ public:
             check(buffer->SetLength(0));require(opened_,E_UNEXPECTED);require(!stopped_,HRESULT_FROM_WIN32(ERROR_CANCELLED));
             DWORD capacity{},unused{};BYTE *out{};check(buffer->Capacity(&capacity));check(buffer->Data(&out,&unused));
             capacity-=capacity%format_.nBlockAlign;require(capacity,E_INVALIDARG);require(out,E_POINTER);
+            if(resume_pending_)replay_to(resume_position_);
             if(consumed_==pcm_.size()&&!next())return S_FALSE;
             auto n=DWORD(std::min<size_t>(capacity,pcm_.size()-consumed_));
             memcpy(out,pcm_.data()+consumed_,n);consumed_+=n;position_+=n/format_.nBlockAlign;return buffer->SetLength(n);
@@ -203,6 +243,7 @@ public:
         return protect([&]()->HRESULT{
             require(opened_,E_UNEXPECTED);require(input_.seekable,STG_E_INVALIDFUNCTION);
             uint64_t desired=uint64_t(*milliseconds)*format_.nSamplesPerSec/1000;
+            if(resume_pending_ || FAILED(io_error_))replay_to(0);
             auto point=std::upper_bound(index_.begin(),index_.end(),desired,[](uint64_t value,const SeekPoint&p){return value<p.sample;});
             if(point!=index_.begin())--point;
             if(point!=index_.end()&&(desired<position_||point->sample>position_)){
@@ -229,7 +270,7 @@ public:
         if(host_tags_)return host_tags_->Get(key,out);if(!key||!out)return E_POINTER;*out=nullptr;
         for(const auto &t:tags_)if(!_stricmp(key,t.key.c_str()))return text(t.value,out);return E_INVALIDARG;
     }
-    HRESULT STDMETHODCALLTYPE Set(const char *key,const wchar_t *value) override{return host_tags_?host_tags_->Set(key,value):E_NOTIMPL;}
+    HRESULT STDMETHODCALLTYPE Set(const char *key,const wchar_t *value) override{if(!opened_||committed_)return E_UNEXPECTED;return host_tags_?host_tags_->Set(key,value):E_NOTIMPL;}
 };
 }
 HRESULT make_reader(void **out){
